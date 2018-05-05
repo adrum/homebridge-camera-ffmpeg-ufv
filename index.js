@@ -51,6 +51,8 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
 ffmpegUfvPlatform.prototype.accessories = function(callback) {
   var self = this;
 
+  var videoProcessor = self.config.videoProcessor || 'ffmpeg';
+
   if (self.config.nvrs) {
 
     var configuredAccessories = [];
@@ -95,6 +97,7 @@ ffmpegUfvPlatform.prototype.accessories = function(callback) {
               var streamingHost;
               var streamingPort;
               var channels = [];
+              var audio = nvrConfig.audio !== false && (self.config.audio || nvrConfig.audio);
 
               // The root of the result is "data"
               var discoveredNvrs = parsedResponse.data;
@@ -175,7 +178,8 @@ ffmpegUfvPlatform.prototype.accessories = function(callback) {
                         "maxStreams": 2,
                         "maxWidth": discoveredChannel.width, // or however we end up getting to this!
                         "maxHeight": discoveredChannel.height,
-                        "maxFPS": discoveredChannel.fps
+                        "maxFPS": discoveredChannel.fps,
+                        "audio": audio,
                       };
 
                       debug('Config: ' + JSON.stringify(videoConfig));
@@ -192,7 +196,7 @@ ffmpegUfvPlatform.prototype.accessories = function(callback) {
 
                       debug(JSON.stringify(cameraConfig));
 
-                      var cameraSource = new UFV(hap, cameraConfig);
+                      var cameraSource = new UFV(hap, cameraConfig, self.log, videoProcessor);
                       cameraAccessory.configureCameraSource(cameraSource);
                       configuredAccessories.push(cameraAccessory);
 
