@@ -4,10 +4,14 @@ var Accessory, hap, UUIDGen, Service, Characteristic;
 
 var http = require('http');
 var https = require('https');
+var URL = require('url');
+var qs = require('qs');
 
 var debug = require('debug')('camera-ffmpeg-ufv');
 var UFV = require('./ufv.js').UFV;
+var MotionSensorAccessory = require('./lib/motion-sensor-accessory');
 
+var API = require('./lib/util/api');
 const apiEndpoint = '/api/2.0';
 
 module.exports = function(homebridge) {
@@ -25,6 +29,8 @@ function ffmpegUfvPlatform(log, config, api) {
 
   self.log = log;
   self.config = config || {};
+  self._accessories = [];
+  self.motionCache = {};
 
   if (api) {
     self.api = api;
@@ -37,11 +43,12 @@ function ffmpegUfvPlatform(log, config, api) {
   }
 }
 
-// Won't be invoked
-ffmpegUfvPlatform.prototype.configureAccessory = function(accessory) {
+// Won't do anything
+ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
+
 }
 
-ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
+ffmpegUfvPlatform.prototype.accessories = function(callback) {
   var self = this;
 
   if (self.config.nvrs) {
@@ -83,6 +90,7 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
 
               // At this point we should have the NVR configuration.
 
+              var server;
               var serverName;
               var streamingHost;
               var streamingPort;
@@ -109,6 +117,8 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
 
                   // Hostname for the streams:
                   streamingHost = discoveredServer.host;
+
+                  server = discoveredServer;
 
                 });
 
@@ -176,6 +186,14 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
                       cameraAccessory.configureCameraSource(cameraSource);
                       configuredAccessories.push(cameraAccessory);
 
+                      // Setup the Motion Sensors for this camera
+                      if (discoveredCamera.recordingSettings.motionRecordEnabled) {
+                        debug('Setting up Motion Sensor for: ' + discoveredCamera.name);
+                        self.setupMotionSensor(hap, nvrConfig, discoveredNvr, server, discoveredCamera);
+                      } else {
+                        self.log('Skipping Motion Sensor due to motion recording not enabled for: ' + discoveredCamera.name);
+                      }
+
                       // Jump out of the loop once we have one:
                       channelIndex = discoveredChannels.length;
 
@@ -199,6 +217,8 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
           } else {
             debug('Status:', res.statusCode);
           }
+
+          callback(self._accessories);
         });
 
       }).on('error', function (err) {
@@ -206,7 +226,98 @@ ffmpegUfvPlatform.prototype.didFinishLaunching = function() {
       });
 
     });
-
   }
 
+}
+
+ffmpegUfvPlatform.prototype.setupMotionSensor = function (homebridge, nvrConfig, discoveredNvr, discoveredServer, discoveredCamera) {
+  var self = this;
+  // Setup Motion Status Caching
+  self.setupMotionCache(nvrConfig, discoveredNvr, discoveredServer, discoveredCamera);
+  var nvrId = UUIDGen.generate(discoveredNvr.nvrName + nvrConfig.apiHost);
+  // Setup Motion Sensor for this camera.
+  var accessory = MotionSensorAccessory.createAccessory(hap, nvrConfig, discoveredCamera, self.motionCache[nvrId]);
+
+  // Guarantee only one motion sensor for this camera
+  for (var i in self.accessories) {
+    var a = self.accessories[i];
+    if (accessory.username == a.username) {
+      accessory.destroy();
+      return;
+    }
+  }
+
+  debug('Discovered Motion Sensor enabled camera ' + discoveredCamera.uuid);
+
+  var properties = new Object({
+    platform: self,
+    name: accessory.displayName,
+    getServices : function(){
+      return this.services;
+    }
+  });
+
+  Object.assign(accessory, properties);
+
+  this._accessories.push(accessory);
+  // this.api.registerPlatformAccessories("homebridge-camera-ffmpeg-ufv", "camera-ffmpeg-ufv", [newAccessory])
+}
+
+ffmpegUfvPlatform.prototype.setupMotionCache = function (nvrConfig, discoveredNvr, discoveredServer, discoveredCamera) {
+
+  var self = this;
+
+  var nvrId = UUIDGen.generate(discoveredNvr.nvrName + nvrConfig.apiHost);
+  if (self.motionCache.hasOwnProperty(nvrId)) {
+    // This NVR is already caching
+    debug('Motion Caching already setup for: ' + discoveredNvr.nvrName);
+    return;
+  }
+
+  debug('Setting up motion cache for: ' + discoveredNvr.nvrName);
+
+  // Setup cache object for all recordings on this NVR
+  self.motionCache[nvrId] = [];
+
+  // Within each NVR we should have one or more cameras:
+  var discoveredCameras = discoveredNvr.cameras;
+  var allCameras = discoveredCameras.map(function(discoveredCamera) {
+      // return discoveredCamera.uuid;
+      return discoveredCamera._id;
+  })
+
+  // Setup timer to cache recordings status
+  setInterval(function () {
+    // Setup timer to fetch cache for motion per nvr
+    var now = Date.now();
+
+    // My docker instance experiences time drift when running on a Mac. This helps with that.
+    var twoHoursInTheFuture = 2 + 60 * 60 * 1000;
+
+    // Set the minimum motion limit to 5 minutes in the past
+    var motionDuration = discoveredServer.alertSettings.motionEmailCoolDownMs; // ms
+    if (motionDuration < 60 * 1000 * 3) {
+      motionDuration = 60 * 1000 * 3;
+    }
+    var options = {
+        query: {
+            // idsOnly: true,
+            startTime: now - motionDuration,
+            endTime: now + twoHoursInTheFuture,
+            sortBy: 'startTime',
+            sort: 'desc',
+            cameras: allCameras,
+            cause:[
+                'motionRecording'
+            ]
+        }
+    }
+    API.get(apiEndpoint,'/recording', options, nvrConfig).then(function(json) {
+        // Clear out the object since it's been passed by reference
+        self.motionCache[nvrId].length = 0;
+        json.data.map(function(recording) {
+            self.motionCache[nvrId].push(recording);
+        });
+      })
+  }, 1000);
 }
